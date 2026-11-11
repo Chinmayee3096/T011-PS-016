@@ -16,16 +16,20 @@ class RemittanceEngine:
         self.rates = rates
         self.holidays = holidays
         self.txn_counter = 1
-        # In-memory store of active transactions: txn_id -> dict
+        # In-memory store: request_id/txn_id -> dict
         self.transactions = {}
+        # Stores debit advice objects: request_id/txn_id -> (DebitAdvice, RemittanceRequest, Customer)
+        self.advices = {}
 
     def process_command_file(self, command_filepath: str):
         with open(command_filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
+            for raw_line in f:
+                line = raw_line.strip()
                 if not line or line.startswith('#'):
                     continue
-                parts = line.split()
+                
+                # Split using pipe delimiter '|'
+                parts = [p.strip() for p in line.split('|')]
                 cmd = parts[0].upper()
 
                 if cmd == 'REMIT':
@@ -36,30 +40,40 @@ class RemittanceEngine:
                     self.handle_cancel(parts[1:])
                 elif cmd == 'RATE_RECHECK':
                     self.handle_rate_recheck(parts[1:])
+                elif cmd == 'PRINT_ADVICE':
+                    self.handle_print_advice(parts[1:])
+                elif cmd == 'PRINT_FY_STATEMENT':
+                    self.handle_print_fy_statement(parts[1:])
+                elif cmd in ('LOAD_CUSTOMERS', 'LOAD_RATES', 'LOAD_HOLIDAYS'):
+                    # Data already loaded in main.py, skip safely
+                    continue
                 else:
                     print(f"Unknown command: {cmd}")
 
         print_fy_summary(self.customers)
 
     def handle_remit(self, args: list[str]):
-        # Format: cust_id currency fx_amount purpose_code beneficiary_country timestamp
-        cust_id, currency, fx_amount_str, purpose_code, beneficiary_country, ts_str = args
-        fx_amount = Decimal(fx_amount_str)
-        req_dt = datetime.fromisoformat(ts_str)
-        req_date = req_dt.date()
-        
-        txn_id = f"TXN-{req_date.strftime('%Y%m%d')}-{self.txn_counter:03d}"
-        self.txn_counter += 1
+        # Format:
+        # req_id, cust_id, currency, amt_type, amount, purpose_code, beneficiary_country, prior_lrs, date_str
+        if len(args) == 9:
+            req_id, cust_id, currency, amt_type, amt_str, purpose_code, beneficiary_country, _, date_str = args
+        elif len(args) == 6:
+            cust_id, currency, amt_str, purpose_code, beneficiary_country, date_str = args
+            req_id = f"RQ-{self.txn_counter:04d}"
+            amt_type = "FX"
+        else:
+            print(f"REMIT: unexpected arguments count {len(args)}: {args}")
+            return
 
-        req = RemittanceRequest(
-            txn_id=txn_id,
-            cust_id=cust_id,
-            currency=currency,
-            fx_amount=fx_amount,
-            purpose_code=purpose_code,
-            beneficiary_country=beneficiary_country,
-            timestamp=req_dt
-        )
+        amount = Decimal(amt_str)
+        try:
+            req_dt = datetime.fromisoformat(date_str)
+        except ValueError:
+            req_dt = datetime.strptime(date_str, '%Y-%m-%d')
+        req_date = req_dt.date()
+
+        txn_id = req_id
+        self.txn_counter += 1
 
         customer = self.customers.get(cust_id)
         if not customer:
@@ -72,11 +86,35 @@ class RemittanceEngine:
             print(f"Error: Missing exchange rate for {currency} on {req_date}.")
             return
 
+        usd_rate = self.rates.get((req_date, 'USD'), Decimal('83.50'))
+
+        # Resolve FX vs INR amount
+        if amt_type.upper() == 'INR':
+            gross_inr = amount.quantize(PAISA, rounding=ROUND_HALF_UP)
+            spread = get_spread(currency, Decimal('0.00'))
+            cust_rate = compute_customer_rate(interbank_rate, spread)
+            fx_amount = (gross_inr / cust_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        else:
+            fx_amount = amount
+            spread = get_spread(currency, fx_amount if currency == 'USD' else (fx_amount * interbank_rate) / usd_rate)
+            cust_rate = compute_customer_rate(interbank_rate, spread)
+            gross_inr = (fx_amount * cust_rate).quantize(PAISA, rounding=ROUND_HALF_UP)
+
         if currency == 'USD':
             usd_equivalent = fx_amount
         else:
-            usd_rate = self.rates.get((req_date, 'USD'), Decimal('83.50'))
             usd_equivalent = (fx_amount * interbank_rate) / usd_rate
+
+        req = RemittanceRequest(
+            txn_id=txn_id,
+            cust_id=cust_id,
+            currency=currency,
+            fx_amount=fx_amount,
+            purpose_code=purpose_code,
+            beneficiary_country=beneficiary_country,
+            timestamp=req_dt,
+            inr_amount=gross_inr
+        )
 
         status, applied_rules, reason = validate_remittance(customer, req, usd_equivalent)
 
@@ -88,15 +126,10 @@ class RemittanceEngine:
                 rule_ids=applied_rules,
                 reject_reason=reason
             )
-            print_debit_advice(advice, req, customer)
+            self.advices[txn_id] = (advice, req, customer)
             return
 
-        # Pre-calculate pricing
         applied_rules.append("BR-03")
-        spread = get_spread(currency, usd_equivalent)
-        cust_rate = compute_customer_rate(interbank_rate, spread)
-        gross_inr = (fx_amount * cust_rate).quantize(PAISA, rounding=ROUND_HALF_UP)
-
         applied_rules.extend(["BR-04", "BR-05"])
         charges = calculate_all_charges(
             gross_inr=gross_inr,
@@ -110,7 +143,6 @@ class RemittanceEngine:
         val_date, vd_rules = compute_value_date(req_dt, currency, usd_equivalent, ind_hols, dest_hols)
         applied_rules.extend(vd_rules)
 
-        # Store booking record
         txn_record = {
             "req": req,
             "customer": customer,
@@ -133,10 +165,10 @@ class RemittanceEngine:
                 rule_ids=applied_rules,
                 reject_reason=reason
             )
-            print_debit_advice(advice, req, customer)
+            self.advices[txn_id] = (advice, req, customer)
             return
 
-        # If ACCEPTED, commit balances
+        # Commit balances for ACCEPTED
         customer.fy_lrs_usd += usd_equivalent
         customer.fy_tcs_inr = charges["updated_fy_inr"]
 
@@ -155,10 +187,9 @@ class RemittanceEngine:
             total_debit_inr=charges["total_debit_inr"],
             value_date=val_date
         )
-        print_debit_advice(advice, req, customer)
+        self.advices[txn_id] = (advice, req, customer)
 
     def handle_approve(self, args: list[str]):
-        """BR-08: Approve a transaction currently on HOLD"""
         txn_id = args[0]
         txn = self.transactions.get(txn_id)
         if not txn or txn["status"] != "HOLD":
@@ -170,22 +201,32 @@ class RemittanceEngine:
         customer.fy_lrs_usd += txn["usd_equivalent"]
         customer.fy_tcs_inr = txn["charges"]["updated_fy_inr"]
 
-        print("=" * 70)
-        print(f"TRANSACTION {txn_id} APPROVED BY COMPLIANCE (BR-08)")
-        print(f"Customer {customer.cust_id} balances updated.")
-        print("=" * 70 + "\n")
+        # Update advice to ACCEPTED
+        advice = DebitAdvice(
+            txn_id=txn_id,
+            cust_id=customer.cust_id,
+            status="ACCEPTED",
+            rule_ids=txn["applied_rules"],
+            interbank_rate=txn["interbank_rate"],
+            customer_rate=txn["customer_rate"],
+            gross_inr=txn["gross_inr"],
+            flat_charge=txn["charges"]["flat_charge"],
+            gst_flat_charge=txn["charges"]["gst_flat_charge"],
+            gst_conversion=txn["charges"]["gst_conversion"],
+            tcs_amount=txn["charges"]["tcs_amount"],
+            total_debit_inr=txn["charges"]["total_debit_inr"],
+            value_date=txn["value_date"]
+        )
+        self.advices[txn_id] = (advice, txn["req"], customer)
 
     def handle_cancel(self, args: list[str]):
-        """
-        BR-09: Cancellation
-        - Free before 14:30 on request day
-        - 1% INR penalty after 14:30
-        - Not allowed after value date
-        """
         txn_id, cancel_ts_str = args[0], args[1]
-        cancel_dt = datetime.fromisoformat(cancel_ts_str)
-        txn = self.transactions.get(txn_id)
+        try:
+            cancel_dt = datetime.fromisoformat(cancel_ts_str)
+        except ValueError:
+            cancel_dt = datetime.strptime(cancel_ts_str, '%Y-%m-%d')
 
+        txn = self.transactions.get(txn_id)
         if not txn:
             print(f"CANCEL ERROR: Transaction {txn_id} not found.")
             return
@@ -194,30 +235,10 @@ class RemittanceEngine:
             print(f"CANCEL REJECTED (BR-09): {txn_id} cannot be cancelled after value date {txn['value_date']}.")
             return
 
-        req = txn["req"]
-        is_same_day = cancel_dt.date() == req.timestamp.date()
-        penalty = Decimal('0.00')
-
-        if is_same_day and cancel_dt.time() < CUTOFF_TIME:
-            msg = "Cancelled free of charge (BR-09: Before 14:30 on booking day)"
-        else:
-            penalty = (txn["gross_inr"] * Decimal('0.01')).quantize(PAISA, rounding=ROUND_HALF_UP)
-            msg = f"Cancelled with 1% penalty: INR {penalty:,.2f} (BR-09)"
-
         txn["status"] = "CANCELLED"
-        # Roll back customer LRS usage
         txn["customer"].fy_lrs_usd -= txn["usd_equivalent"]
 
-        print("=" * 70)
-        print(f"CANCELLATION PROCESSED: {txn_id}")
-        print(f"Status: {msg}")
-        print("=" * 70 + "\n")
-
     def handle_rate_recheck(self, args: list[str]):
-        """
-        BR-10: RATE_RECHECK
-        If interbank rate moves > 1% against bank before value date, re-price and debit difference.
-        """
         txn_id, check_date_str = args[0], args[1]
         check_date = datetime.strptime(check_date_str, '%Y-%m-%d').date()
         txn = self.transactions.get(txn_id)
@@ -235,15 +256,33 @@ class RemittanceEngine:
         booking_rate = txn["interbank_rate"]
         triggered, diff = check_rate_recheck(booking_rate, current_rate)
 
-        print("=" * 70)
-        print(f"RATE RECHECK (BR-10) FOR {txn_id}")
-        print(f"Original Rate: {booking_rate:,.4f} | Current Rate: {current_rate:,.4f}")
         if triggered:
             spread = get_spread(currency, txn["usd_equivalent"])
             new_cust_rate = compute_customer_rate(current_rate, spread)
             new_gross = (txn["req"].fx_amount * new_cust_rate).quantize(PAISA, rounding=ROUND_HALF_UP)
             diff_debit = new_gross - txn["gross_inr"]
-            print(f"Movement > 1% against bank! Additional Debit: INR {diff_debit:,.2f}")
+            txn["gross_inr"] = new_gross
+            txn["charges"]["total_debit_inr"] += diff_debit
+
+    def handle_print_advice(self, args: list[str]):
+        req_id = args[0]
+        advice_tuple = self.advices.get(req_id)
+        if advice_tuple:
+            advice, req, customer = advice_tuple
+            print_debit_advice(advice, req, customer)
         else:
-            print("Movement within 1% threshold. No price adjustment required.")
-        print("=" * 70 + "\n")
+            print(f"ADVICE ERROR: No advice found for {req_id}")
+
+    def handle_print_fy_statement(self, args: list[str]):
+        cust_id = args[0]
+        fy = args[1] if len(args) > 1 else "2026-27"
+        customer = self.customers.get(cust_id)
+        if customer:
+            print("=" * 70)
+            print(f"           ANNUAL STATEMENT FOR {cust_id} (FY {fy})           ")
+            print("=" * 70)
+            print(f"Customer Name : {customer.name}")
+            print(f"PAN           : {customer.pan}")
+            print(f"LRS Utilised  : USD {customer.fy_lrs_usd:>10,.2f}")
+            print(f"Cumulative INR: INR {customer.fy_tcs_inr:>10,.2f}")
+            print("=" * 70 + "\n")
